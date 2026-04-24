@@ -175,7 +175,10 @@ runs:
       env:
         VAR_FILE: ${{ inputs.var-file }}
       run: |
-        set -uo pipefail
+        # Disable errexit — `terraform plan -detailed-exitcode` returns 2
+        # when there are changes (not a failure). We check the code manually.
+        set +e
+        set -u
         args=(-input=false -lock-timeout=5m -detailed-exitcode -out=tfplan.binary -no-color)
         if [ -n "${VAR_FILE}" ]; then
           args+=(-var-file="${VAR_FILE}")
@@ -195,6 +198,7 @@ runs:
           cat plan.trunc.txt
           echo "__TFEOF__"
         } >> "${GITHUB_OUTPUT}"
+        # Only exit code 1 is a real failure. 0 = no changes, 2 = changes.
         if [ "${code}" -eq 1 ]; then exit 1; fi
         exit 0
 
