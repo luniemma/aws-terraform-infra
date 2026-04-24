@@ -97,15 +97,17 @@ runs:
         terraform_version: ${{ inputs.terraform-version }}
         terraform_wrapper: false
 
+    # Cache is scoped per workspace — `.terraform/` holds backend init
+    # state that's env-specific, so dev and staging must not share it.
     - name: Cache Terraform providers and modules
       uses: actions/cache@v4
       with:
         path: |
           ${{ inputs.working-directory }}/.terraform
           ~/.terraform.d/plugin-cache
-        key: ${{ runner.os }}-tf-${{ inputs.terraform-version }}-${{ hashFiles(format('{0}/**/.terraform.lock.hcl', inputs.working-directory), format('{0}/**/*.tf', inputs.working-directory)) }}
+        key: ${{ runner.os }}-tf-${{ inputs.terraform-version }}-${{ inputs.workspace || 'default' }}-${{ hashFiles(format('{0}/**/.terraform.lock.hcl', inputs.working-directory), format('{0}/**/*.tf', inputs.working-directory)) }}
         restore-keys: |
-          ${{ runner.os }}-tf-${{ inputs.terraform-version }}-
+          ${{ runner.os }}-tf-${{ inputs.terraform-version }}-${{ inputs.workspace || 'default' }}-
 
     # -------------------------------------------------------------------------
     # 3. Static checks
@@ -132,7 +134,11 @@ runs:
         BACKEND_CONFIG: ${{ inputs.backend-config }}
       run: |
         set -euo pipefail
-        args=(-input=false -lock-timeout=5m)
+        # `-reconfigure` discards any cached backend-init state. CI never
+        # migrates state across backends — it always reinitialises with the
+        # backend-config passed in for this run. Without it, a cache restored
+        # from a different workspace causes "Backend configuration changed".
+        args=(-input=false -lock-timeout=5m -reconfigure)
         if [ -n "${BACKEND_CONFIG}" ]; then
           while IFS= read -r line; do
             line="${line## }"
