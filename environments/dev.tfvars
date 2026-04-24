@@ -23,7 +23,7 @@ ec2_in_public_subnet = true
 assign_eip           = false
 
 # Storage
-root_volume_size = 20
+root_volume_size = 30
 root_volume_type = "gp3"
 
 # Monitoring
