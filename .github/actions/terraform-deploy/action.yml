@@ -200,17 +200,29 @@ runs:
         terraform plan "${args[@]}" | tee plan.txt
         code=${PIPESTATUS[0]}
         echo "exitcode=${code}" >> "${GITHUB_OUTPUT}"
+
+        # Multi-line outputs use GitHub's heredoc form:
+        #   key<<DELIM
+        #   ...content...
+        #   DELIM
+        # DELIM must appear on a line by itself. `head -c` can truncate mid-line
+        # with no trailing newline, gluing the closing DELIM onto content and
+        # breaking the parser. Randomise DELIM per run so it can't collide with
+        # plan content, and always printf '\n' before writing DELIM.
+        delim="GHOUT_$(openssl rand -hex 16 2>/dev/null || date +%s%N)"
+
         {
-          echo "summary<<__TFEOF__"
+          printf 'summary<<%s\n' "${delim}"
           grep -E '^(Plan:|No changes\.|Error:)' plan.txt | head -n 3 || echo "no summary line"
-          echo "__TFEOF__"
+          printf '\n%s\n' "${delim}"
         } >> "${GITHUB_OUTPUT}"
-        # Truncate plan output to ~60KB for PR comments (GitHub limit is 65536)
+
+        # Truncate plan output to ~60KB for PR comments (GitHub limit is 65536).
         head -c 60000 plan.txt > plan.trunc.txt
         {
-          echo "stdout<<__TFEOF__"
+          printf 'stdout<<%s\n' "${delim}"
           cat plan.trunc.txt
-          echo "__TFEOF__"
+          printf '\n%s\n' "${delim}"
         } >> "${GITHUB_OUTPUT}"
         # Only exit code 1 is a real failure. 0 = no changes, 2 = changes.
         if [ "${code}" -eq 1 ]; then exit 1; fi
