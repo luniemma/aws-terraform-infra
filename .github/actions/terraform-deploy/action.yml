@@ -1,0 +1,247 @@
+name: Terraform Deploy
+description: >
+  Reusable composite action that runs fmt / init / validate / plan and optionally apply
+  against AWS using GitHub OIDC. Uploads the signed plan artifact on plan runs, applies
+  exactly that artifact on apply runs, and writes a rich step summary.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECURITY NOTE
+# Third-party actions below are pinned to major-version tags for readability.
+# For hardened production use, replace each tag with a full commit SHA — see
+# https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions
+# ──────────────────────────────────────────────────────────────────────────────
+
+inputs:
+  working-directory:
+    description: Directory containing the root Terraform configuration.
+    required: false
+    default: .
+  terraform-version:
+    description: Terraform CLI version to install (exact, not a range).
+    required: false
+    default: 1.9.8
+  aws-region:
+    description: AWS region the role is assumed in.
+    required: true
+  aws-role-to-assume:
+    description: ARN of the IAM role to assume via GitHub OIDC.
+    required: true
+  aws-role-session-name:
+    description: Session name for the assumed role (visible in CloudTrail).
+    required: false
+    default: github-actions-terraform
+  action:
+    description: "`plan` or `apply`. `apply` always plans first and applies the produced plan."
+    required: false
+    default: plan
+  var-file:
+    description: Path to a .tfvars file relative to working-directory. Leave empty to skip.
+    required: false
+    default: ""
+  backend-config:
+    description: Multiline list of `key=value` pairs passed as `-backend-config`. One per line.
+    required: false
+    default: ""
+  workspace:
+    description: Terraform workspace to select/create. Leave empty to stay on `default`.
+    required: false
+    default: ""
+  plan-artifact-name:
+    description: Name of the plan artifact uploaded on plan runs.
+    required: false
+    default: tfplan
+  download-plan-artifact:
+    description: When `apply`, download this artifact (produced by an earlier plan job) instead of re-planning.
+    required: false
+    default: ""
+  fail-on-format:
+    description: Whether a `terraform fmt` difference should fail the run.
+    required: false
+    default: "true"
+
+outputs:
+  plan-exitcode:
+    description: Exit code from `terraform plan -detailed-exitcode` (0 = no changes, 2 = changes).
+    value: ${{ steps.plan.outputs.exitcode }}
+  plan-summary:
+    description: Short human-readable summary of the plan (single line).
+    value: ${{ steps.plan.outputs.summary }}
+  plan-stdout:
+    description: Truncated, no-color plan output suitable for posting as a PR comment.
+    value: ${{ steps.plan.outputs.stdout }}
+
+runs:
+  using: composite
+  steps:
+    # -------------------------------------------------------------------------
+    # 1. Auth
+    # -------------------------------------------------------------------------
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-to-assume }}
+        role-session-name: ${{ inputs.aws-role-session-name }}
+        aws-region: ${{ inputs.aws-region }}
+        mask-aws-account-id: true
+
+    # -------------------------------------------------------------------------
+    # 2. Toolchain
+    # -------------------------------------------------------------------------
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: Cache Terraform providers and modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.working-directory }}/.terraform
+          ~/.terraform.d/plugin-cache
+        key: ${{ runner.os }}-tf-${{ inputs.terraform-version }}-${{ hashFiles(format('{0}/**/.terraform.lock.hcl', inputs.working-directory), format('{0}/**/*.tf', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ runner.os }}-tf-${{ inputs.terraform-version }}-
+
+    # -------------------------------------------------------------------------
+    # 3. Static checks
+    # -------------------------------------------------------------------------
+    - name: Terraform fmt
+      id: fmt
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        FAIL_ON_FORMAT: ${{ inputs.fail-on-format }}
+      run: |
+        set -euo pipefail
+        if [ "${FAIL_ON_FORMAT}" = "true" ]; then
+          terraform fmt -check -recursive -diff
+        else
+          terraform fmt -check -recursive -diff || echo "::warning::terraform fmt found diffs"
+        fi
+
+    - name: Terraform init
+      id: init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BACKEND_CONFIG: ${{ inputs.backend-config }}
+      run: |
+        set -euo pipefail
+        args=(-input=false -lock-timeout=5m)
+        if [ -n "${BACKEND_CONFIG}" ]; then
+          while IFS= read -r line; do
+            line="${line## }"
+            line="${line%% }"
+            [ -z "${line}" ] && continue
+            args+=("-backend-config=${line}")
+          done <<< "${BACKEND_CONFIG}"
+        fi
+        terraform init "${args[@]}"
+
+    - name: Select workspace
+      if: inputs.workspace != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKSPACE: ${{ inputs.workspace }}
+      run: |
+        set -euo pipefail
+        terraform workspace select -or-create "${WORKSPACE}"
+
+    - name: Terraform validate
+      id: validate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        terraform validate -no-color
+
+    # -------------------------------------------------------------------------
+    # 4a. Plan (skipped when reusing a downloaded plan artifact)
+    # -------------------------------------------------------------------------
+    - name: Download plan artifact
+      if: inputs.action == 'apply' && inputs.download-plan-artifact != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.download-plan-artifact }}
+        path: ${{ inputs.working-directory }}
+
+    - name: Terraform plan
+      id: plan
+      if: inputs.action == 'plan' || inputs.download-plan-artifact == ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        VAR_FILE: ${{ inputs.var-file }}
+      run: |
+        set -uo pipefail
+        args=(-input=false -lock-timeout=5m -detailed-exitcode -out=tfplan.binary -no-color)
+        if [ -n "${VAR_FILE}" ]; then
+          args+=(-var-file="${VAR_FILE}")
+        fi
+        terraform plan "${args[@]}" | tee plan.txt
+        code=${PIPESTATUS[0]}
+        echo "exitcode=${code}" >> "${GITHUB_OUTPUT}"
+        {
+          echo "summary<<__TFEOF__"
+          grep -E '^(Plan:|No changes\.|Error:)' plan.txt | head -n 3 || echo "no summary line"
+          echo "__TFEOF__"
+        } >> "${GITHUB_OUTPUT}"
+        # Truncate plan output to ~60KB for PR comments (GitHub limit is 65536)
+        head -c 60000 plan.txt > plan.trunc.txt
+        {
+          echo "stdout<<__TFEOF__"
+          cat plan.trunc.txt
+          echo "__TFEOF__"
+        } >> "${GITHUB_OUTPUT}"
+        if [ "${code}" -eq 1 ]; then exit 1; fi
+        exit 0
+
+    - name: Write plan summary to job summary
+      if: always() && steps.plan.outcome != 'skipped'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        {
+          echo "## Terraform plan — \`${{ inputs.workspace || 'default' }}\`"
+          echo ""
+          echo "- **fmt**: ${{ steps.fmt.outcome }}"
+          echo "- **init**: ${{ steps.init.outcome }}"
+          echo "- **validate**: ${{ steps.validate.outcome }}"
+          echo "- **plan exit code**: ${{ steps.plan.outputs.exitcode || 'n/a' }}"
+          echo ""
+          echo '<details><summary>Show plan</summary>'
+          echo ''
+          echo '```terraform'
+          head -c 60000 plan.txt || true
+          echo ''
+          echo '```'
+          echo '</details>'
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    # -------------------------------------------------------------------------
+    # 4b. Upload / 5. Apply
+    # -------------------------------------------------------------------------
+    - name: Upload plan artifact
+      if: inputs.action == 'plan' && steps.plan.outputs.exitcode == '2'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.plan-artifact-name }}
+        path: |
+          ${{ inputs.working-directory }}/tfplan.binary
+          ${{ inputs.working-directory }}/plan.txt
+        retention-days: 14
+        if-no-files-found: error
+
+    - name: Terraform apply
+      if: inputs.action == 'apply'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        if [ ! -f tfplan.binary ]; then
+          echo "::error::tfplan.binary missing — plan step did not run and no artifact was downloaded"
+          exit 1
+        fi
+        terraform apply -input=false -lock-timeout=5m -auto-approve tfplan.binary

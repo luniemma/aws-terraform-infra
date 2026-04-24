@@ -1,0 +1,20 @@
+# Terraform state & cache
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Sensitive variable files
+terraform.tfvars
+*.auto.tfvars
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local IAM bootstrap files (contain AWS account ID)
+trust-policy.json
+gha-terraform-policy.json

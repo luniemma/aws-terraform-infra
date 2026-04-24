@@ -1,0 +1,287 @@
+name: Terraform
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+#   - PR to main         → validate + plan (comment on PR)
+#   - Push to main       → validate + plan + apply (environment: dev)
+#   - Manual dispatch    → pick env + action (plan|apply); apply requires approval
+#                         on the selected GitHub Environment (protect prod there).
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths: &tf-paths
+      - "**.tf"
+      - "**.tfvars"
+      - "environments/**"
+      - "userdata.sh"
+      - ".github/workflows/terraform.yml"
+      - ".github/actions/terraform-deploy/**"
+  push:
+    branches: [main, master]
+    paths: *tf-paths
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+      action:
+        description: plan or apply
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+
+# Deny-by-default. Each job re-requests exactly what it needs.
+permissions: {}
+
+# Serialise applies per environment so two pushes never fight for the state lock.
+# Plans still run in parallel because the group is different.
+concurrency:
+  group: tf-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || (inputs.environment || 'dev') }}-${{ github.event_name == 'pull_request' && 'plan' || (inputs.action || 'apply') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  TF_CLI_ARGS: "-no-color"
+  # Override by setting repo variable TERRAFORM_VERSION.
+  TERRAFORM_VERSION: ${{ vars.TERRAFORM_VERSION || '1.9.8' }}
+  RUNNER_IMAGE:      ${{ vars.RUNNER_IMAGE    || 'ubuntu-latest' }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Resolve the target environment once and expose it to downstream jobs.
+  # ────────────────────────────────────────────────────────────────────────────
+  config:
+    name: Resolve config
+    runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
+    timeout-minutes: 2
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      action:      ${{ steps.env.outputs.action }}
+      tfvars:      ${{ steps.env.outputs.tfvars }}
+      run-apply:   ${{ steps.env.outputs.run-apply }}
+    steps:
+      - id: env
+        shell: bash
+        env:
+          EVENT:         ${{ github.event_name }}
+          INPUT_ENV:     ${{ inputs.environment }}
+          INPUT_ACTION:  ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            pull_request)     env="dev"; action="plan" ;;
+            push)             env="dev"; action="apply" ;;
+            workflow_dispatch) env="${INPUT_ENV}"; action="${INPUT_ACTION}" ;;
+            *) echo "::error::Unsupported event: ${EVENT}"; exit 1 ;;
+          esac
+          echo "environment=${env}"                         >> "${GITHUB_OUTPUT}"
+          echo "action=${action}"                           >> "${GITHUB_OUTPUT}"
+          echo "tfvars=environments/${env}.tfvars"          >> "${GITHUB_OUTPUT}"
+          echo "run-apply=$([ "${action}" = "apply" ] && echo true || echo false)" >> "${GITHUB_OUTPUT}"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Static checks: fmt + validate. Cheap, fails fast, runs in parallel with scan.
+  # ────────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate
+    needs: config
+    runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Security scan. Non-blocking by default; flip to `exit-code: 1` to enforce.
+  # ────────────────────────────────────────────────────────────────────────────
+  scan:
+    name: Security scan
+    needs: config
+    runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1
+        continue-on-error: true
+        with:
+          soft_fail: true
+          format: sarif
+          additional_args: --out tfsec.sarif
+
+      - name: Upload SARIF
+        if: always() && hashFiles('tfsec.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Plan. Always runs. Uploads tfplan.binary for the apply job to consume.
+  # ────────────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan (${{ needs.config.outputs.environment }})
+    needs: [config, validate]
+    runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    environment: ${{ needs.config.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Terraform plan
+        id: tf
+        uses: ./.github/actions/terraform-deploy
+        with:
+          working-directory: .
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+          aws-region: ${{ vars.AWS_REGION }}
+          aws-role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-role-session-name: gha-${{ github.run_id }}-plan
+          action: plan
+          var-file: ${{ needs.config.outputs.tfvars }}
+          workspace: ${{ needs.config.outputs.environment }}
+          plan-artifact-name: tfplan-${{ needs.config.outputs.environment }}-${{ github.run_id }}
+          backend-config: |
+            bucket=${{ vars.TF_STATE_BUCKET }}
+            key=${{ needs.config.outputs.environment }}/terraform.tfstate
+            region=${{ vars.AWS_REGION }}
+            dynamodb_table=${{ vars.TF_LOCK_TABLE }}
+            encrypt=true
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ needs.config.outputs.environment }}
+          EXITCODE:    ${{ steps.tf.outputs.plan-exitcode }}
+          SUMMARY:     ${{ steps.tf.outputs.plan-summary }}
+          PLAN_STDOUT: ${{ steps.tf.outputs.plan-stdout }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const env = process.env.ENVIRONMENT;
+            const code = process.env.EXITCODE;
+            const summary = process.env.SUMMARY || '(no summary)';
+            const body = [
+              `### Terraform plan — \`${env}\``,
+              '',
+              code === '0' ? '**No changes.**'
+                : code === '2' ? '**Changes detected.**'
+                : '**Plan failed.**',
+              '',
+              '```',
+              summary.trim(),
+              '```',
+              '',
+              '<details><summary>Full plan output</summary>',
+              '',
+              '```terraform',
+              (process.env.PLAN_STDOUT || '').slice(0, 55000),
+              '```',
+              '</details>',
+              '',
+              `_Run: [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) • commit \`${context.sha.slice(0,7)}\`_`,
+            ].join('\n');
+
+            // Upsert: find a previous comment from this workflow for this env and edit it,
+            // otherwise create a new one. Keeps the PR clean across repeated pushes.
+            const marker = `<!-- terraform-plan:${env} -->`;
+            const bodyWithMarker = `${marker}\n${body}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body && c.body.startsWith(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: bodyWithMarker,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: bodyWithMarker,
+              });
+            }
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Apply. Gated by `needs.config.outputs.run-apply`. Pulls the *exact* plan
+  # produced by the plan job — no re-plan, no drift between preview and apply.
+  # ────────────────────────────────────────────────────────────────────────────
+  apply:
+    name: Apply (${{ needs.config.outputs.environment }})
+    needs: [config, validate, plan]
+    if: needs.config.outputs.run-apply == 'true'
+    runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    environment: ${{ needs.config.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Terraform apply
+        uses: ./.github/actions/terraform-deploy
+        with:
+          working-directory: .
+          terraform-version: ${{ env.TERRAFORM_VERSION }}
+          aws-region: ${{ vars.AWS_REGION }}
+          aws-role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-role-session-name: gha-${{ github.run_id }}-apply
+          action: apply
+          var-file: ${{ needs.config.outputs.tfvars }}
+          workspace: ${{ needs.config.outputs.environment }}
+          download-plan-artifact: tfplan-${{ needs.config.outputs.environment }}-${{ github.run_id }}
+          backend-config: |
+            bucket=${{ vars.TF_STATE_BUCKET }}
+            key=${{ needs.config.outputs.environment }}/terraform.tfstate
+            region=${{ vars.AWS_REGION }}
+            dynamodb_table=${{ vars.TF_LOCK_TABLE }}
+            encrypt=true
