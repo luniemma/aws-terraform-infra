@@ -253,8 +253,12 @@ runs:
     # -------------------------------------------------------------------------
     # 4b. Upload / 5. Apply
     # -------------------------------------------------------------------------
+    # Upload on any successful plan (exit 0 = no changes, 2 = changes). This way
+    # the apply job can always download an artifact; applying a no-change plan
+    # is a harmless no-op. Previously we only uploaded on code=2, which caused
+    # the apply job to fail downloading when a destroy found nothing to remove.
     - name: Upload plan artifact
-      if: inputs.action == 'plan' && steps.plan.outputs.exitcode == '2'
+      if: inputs.action == 'plan' && steps.plan.outcome == 'success'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.plan-artifact-name }}
