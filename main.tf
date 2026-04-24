@@ -57,24 +57,24 @@ module "vpc" {
 module "ec2" {
   source = "./modules/ec2"
 
-  project_name           = var.project_name
-  environment            = var.environment
-  vpc_id                 = module.vpc.vpc_id
-  public_subnet_ids      = module.vpc.public_subnet_ids
-  private_subnet_ids     = module.vpc.private_subnet_ids
-  instance_type          = var.instance_type
-  ami_id                 = var.ami_id
-  instance_count         = var.instance_count
-  ec2_in_public_subnet   = var.ec2_in_public_subnet
-  assign_eip             = var.assign_eip
-  public_key_path        = var.public_key_path
-  allowed_ssh_cidrs      = var.allowed_ssh_cidrs
-  root_volume_size       = var.root_volume_size
-  root_volume_type       = var.root_volume_type
-  additional_ebs_volumes = var.additional_ebs_volumes
+  project_name               = var.project_name
+  environment                = var.environment
+  vpc_id                     = module.vpc.vpc_id
+  public_subnet_ids          = module.vpc.public_subnet_ids
+  private_subnet_ids         = module.vpc.private_subnet_ids
+  instance_type              = var.instance_type
+  ami_id                     = var.ami_id
+  instance_count             = var.instance_count
+  ec2_in_public_subnet       = var.ec2_in_public_subnet
+  assign_eip                 = var.assign_eip
+  public_key_path            = var.public_key_path
+  allowed_ssh_cidrs          = var.allowed_ssh_cidrs
+  root_volume_size           = var.root_volume_size
+  root_volume_type           = var.root_volume_type
+  additional_ebs_volumes     = var.additional_ebs_volumes
   enable_detailed_monitoring = var.enable_detailed_monitoring
-  cpu_alarm_threshold    = var.cpu_alarm_threshold
-  alarm_sns_topic_arn    = var.alarm_sns_topic_arn
+  cpu_alarm_threshold        = var.cpu_alarm_threshold
+  alarm_sns_topic_arn        = var.alarm_sns_topic_arn
 }
 
 ################################################################################
@@ -85,10 +85,10 @@ module "eks" {
   source = "./modules/eks"
   count  = var.enable_eks ? 1 : 0
 
-  project_name     = var.project_name
-  environment      = var.environment
-  vpc_id           = module.vpc.vpc_id
-  vpc_cidr         = var.vpc_cidr
+  project_name       = var.project_name
+  environment        = var.environment
+  vpc_id             = module.vpc.vpc_id
+  vpc_cidr           = var.vpc_cidr
   public_subnet_ids  = module.vpc.public_subnet_ids
   private_subnet_ids = module.vpc.private_subnet_ids
 

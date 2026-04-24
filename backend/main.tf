@@ -51,9 +51,9 @@ resource "aws_s3_bucket" "tfstate" {
   }
 
   tags = {
-    Name        = "${var.project_name}-${var.environment}-tfstate"
-    Purpose     = "Terraform State"
-    ManagedBy   = "Terraform"
+    Name      = "${var.project_name}-${var.environment}-tfstate"
+    Purpose   = "Terraform State"
+    ManagedBy = "Terraform"
   }
 }
 
