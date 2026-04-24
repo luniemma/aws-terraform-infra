@@ -132,13 +132,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: tfsec
-        uses: aquasecurity/tfsec-action@v1
+      # Install tfsec directly instead of depending on a third-party action tag.
+      # Pin TFSEC_VERSION via repo variable to reproduce; defaults to latest.
+      - name: Run tfsec
         continue-on-error: true
-        with:
-          soft_fail: true
-          format: sarif
-          additional_args: --out tfsec.sarif
+        env:
+          TFSEC_VERSION: ${{ vars.TFSEC_VERSION || 'latest' }}
+        run: |
+          set -euo pipefail
+          if [ "${TFSEC_VERSION}" = "latest" ]; then
+            url="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
+          else
+            url="https://github.com/aquasecurity/tfsec/releases/download/${TFSEC_VERSION}/tfsec-linux-amd64"
+          fi
+          curl -fsSL "${url}" -o /tmp/tfsec
+          chmod +x /tmp/tfsec
+          /tmp/tfsec --version
+          /tmp/tfsec --soft-fail --format sarif --out tfsec.sarif .
+          /tmp/tfsec --soft-fail .
 
       - name: Upload SARIF
         if: always() && hashFiles('tfsec.sarif') != ''
