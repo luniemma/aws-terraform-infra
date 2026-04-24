@@ -31,9 +31,13 @@ inputs:
     required: false
     default: github-actions-terraform
   action:
-    description: "`plan` or `apply`. `apply` always plans first and applies the produced plan."
+    description: "`plan` (generate + upload plan) or `apply` (download + apply plan). Drives which CI phase the composite runs."
     required: false
     default: plan
+  destroy:
+    description: "When `true`, the plan step runs `terraform plan -destroy`. The apply phase just applies whatever tfplan.binary contains, so it destroys too."
+    required: false
+    default: "false"
   var-file:
     description: Path to a .tfvars file relative to working-directory. Leave empty to skip.
     required: false
@@ -174,12 +178,16 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       env:
         VAR_FILE: ${{ inputs.var-file }}
+        DESTROY:  ${{ inputs.destroy }}
       run: |
         # Disable errexit — `terraform plan -detailed-exitcode` returns 2
         # when there are changes (not a failure). We check the code manually.
         set +e
         set -u
         args=(-input=false -lock-timeout=5m -detailed-exitcode -out=tfplan.binary -no-color)
+        if [ "${DESTROY}" = "true" ]; then
+          args+=(-destroy)
+        fi
         if [ -n "${VAR_FILE}" ]; then
           args+=(-var-file="${VAR_FILE}")
         fi
@@ -242,10 +250,15 @@ runs:
       if: inputs.action == 'apply'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        DESTROY: ${{ inputs.destroy }}
       run: |
         set -euo pipefail
         if [ ! -f tfplan.binary ]; then
           echo "::error::tfplan.binary missing — plan step did not run and no artifact was downloaded"
           exit 1
+        fi
+        if [ "${DESTROY}" = "true" ]; then
+          echo "Applying DESTROY plan — resources will be removed."
         fi
         terraform apply -input=false -lock-timeout=5m -auto-approve tfplan.binary

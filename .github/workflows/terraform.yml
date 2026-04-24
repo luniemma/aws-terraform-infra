@@ -30,11 +30,15 @@ on:
         type: choice
         options: [dev, staging, prod]
       action:
-        description: plan or apply
+        description: plan / apply / destroy
         required: true
         default: plan
         type: choice
-        options: [plan, apply]
+        options: [plan, apply, destroy]
+      confirmation:
+        description: 'Required for destroy: type "destroy <environment>" exactly (e.g. "destroy prod")'
+        required: false
+        default: ''
 
 # Deny-by-default. Each job re-requests exactly what it needs.
 permissions: {}
@@ -70,21 +74,39 @@ jobs:
       - id: env
         shell: bash
         env:
-          EVENT:         ${{ github.event_name }}
-          INPUT_ENV:     ${{ inputs.environment }}
-          INPUT_ACTION:  ${{ inputs.action }}
+          EVENT:              ${{ github.event_name }}
+          INPUT_ENV:          ${{ inputs.environment }}
+          INPUT_ACTION:       ${{ inputs.action }}
+          INPUT_CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -euo pipefail
           case "${EVENT}" in
-            pull_request)     env="dev"; action="plan" ;;
-            push)             env="dev"; action="apply" ;;
+            pull_request)      env="dev"; action="plan" ;;
+            push)              env="dev"; action="apply" ;;
             workflow_dispatch) env="${INPUT_ENV}"; action="${INPUT_ACTION}" ;;
             *) echo "::error::Unsupported event: ${EVENT}"; exit 1 ;;
           esac
-          echo "environment=${env}"                         >> "${GITHUB_OUTPUT}"
-          echo "action=${action}"                           >> "${GITHUB_OUTPUT}"
-          echo "tfvars=environments/${env}.tfvars"          >> "${GITHUB_OUTPUT}"
-          echo "run-apply=$([ "${action}" = "apply" ] && echo true || echo false)" >> "${GITHUB_OUTPUT}"
+
+          # Destroy requires a typed confirmation matching "destroy <env>" exactly.
+          if [ "${action}" = "destroy" ]; then
+            expected="destroy ${env}"
+            if [ "${INPUT_CONFIRMATION:-}" != "${expected}" ]; then
+              echo "::error::destroy requires confirmation input to be exactly \"${expected}\" (got: \"${INPUT_CONFIRMATION:-}\")"
+              exit 1
+            fi
+            echo "::warning::Destroy confirmed for environment \"${env}\" — all managed resources will be removed."
+          fi
+
+          # apply and destroy both run the apply job downstream (they apply different plan artifacts).
+          case "${action}" in
+            apply|destroy) run_apply=true ;;
+            *)             run_apply=false ;;
+          esac
+
+          echo "environment=${env}"                  >> "${GITHUB_OUTPUT}"
+          echo "action=${action}"                    >> "${GITHUB_OUTPUT}"
+          echo "tfvars=environments/${env}.tfvars"   >> "${GITHUB_OUTPUT}"
+          echo "run-apply=${run_apply}"              >> "${GITHUB_OUTPUT}"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Static checks: fmt + validate. Cheap, fails fast, runs in parallel with scan.
@@ -161,7 +183,7 @@ jobs:
   # Plan. Always runs. Uploads tfplan.binary for the apply job to consume.
   # ────────────────────────────────────────────────────────────────────────────
   plan:
-    name: Plan (${{ needs.config.outputs.environment }})
+    name: ${{ needs.config.outputs.action == 'destroy' && 'Plan destroy' || 'Plan' }} (${{ needs.config.outputs.environment }})
     needs: [config, validate]
     runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
     timeout-minutes: 20
@@ -185,6 +207,7 @@ jobs:
           aws-role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-role-session-name: gha-${{ github.run_id }}-plan
           action: plan
+          destroy: ${{ needs.config.outputs.action == 'destroy' }}
           var-file: ${{ needs.config.outputs.tfvars }}
           workspace: ${{ needs.config.outputs.environment }}
           plan-artifact-name: tfplan-${{ needs.config.outputs.environment }}-${{ github.run_id }}
@@ -264,7 +287,7 @@ jobs:
   # produced by the plan job — no re-plan, no drift between preview and apply.
   # ────────────────────────────────────────────────────────────────────────────
   apply:
-    name: Apply (${{ needs.config.outputs.environment }})
+    name: ${{ needs.config.outputs.action == 'destroy' && 'Destroy' || 'Apply' }} (${{ needs.config.outputs.environment }})
     needs: [config, validate, plan]
     if: needs.config.outputs.run-apply == 'true'
     runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
@@ -287,6 +310,7 @@ jobs:
           aws-role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-role-session-name: gha-${{ github.run_id }}-apply
           action: apply
+          destroy: ${{ needs.config.outputs.action == 'destroy' }}
           var-file: ${{ needs.config.outputs.tfvars }}
           workspace: ${{ needs.config.outputs.environment }}
           download-plan-artifact: tfplan-${{ needs.config.outputs.environment }}-${{ github.run_id }}

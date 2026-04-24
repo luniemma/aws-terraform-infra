@@ -374,7 +374,7 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
 |---|---|---|
 | PR to `main` | `dev` | validate, scan, plan (comments on PR) |
 | Push to `main` | `dev` | validate, scan, plan, apply |
-| `workflow_dispatch` | `dev` / `staging` / `prod` (pick) | validate, scan, plan, apply (if selected) |
+| `workflow_dispatch` | `dev` / `staging` / `prod` (pick) | validate, scan, plan, apply/destroy (if selected) |
 
 ### Best-practice features baked in
 
@@ -513,9 +513,47 @@ The NAT Gateway and the EKS control plane are the line items that hurt. Turn the
 
 ## Destroying the stack
 
+### Via the GitHub Actions pipeline (recommended)
+
+The workflow supports a `destroy` action via manual dispatch. It's identical to the apply flow — same plan→apply artifact hand-off, same GitHub Environment approval gate — except the plan step runs `terraform plan -destroy`. Reviewers see exactly what will be removed on the PR-less step summary before any resource is touched.
+
+Two layers of protection:
+
+1. **Only `workflow_dispatch` can trigger destroy.** Pushes and PRs cannot. The `action` input is a typed choice locked to `plan` / `apply` / `destroy`.
+2. **Typed confirmation.** The dispatch form has a `confirmation` input. You must type `destroy <environment>` exactly (e.g. `destroy prod`). The config job fails the run with a clear error otherwise. Prevents fat-finger destroys and drive-by "just click apply" accidents.
+
+Via the GitHub UI:
+
+1. Actions → **Terraform** workflow → **Run workflow**
+2. Environment: `dev` / `staging` / `prod`
+3. Action: `destroy`
+4. Confirmation: type exactly `destroy dev` (or `destroy staging`, `destroy prod`)
+5. Run
+
+Via `gh` CLI:
+
 ```bash
-terraform destroy
+gh workflow run terraform.yml --ref master \
+  -f environment=dev \
+  -f action=destroy \
+  -f confirmation="destroy dev"
 ```
+
+If `prod` has required reviewers on its GitHub Environment, the destroy apply step will pause for approval. Decline to abort.
+
+### Local destroy
+
+```bash
+terraform init \
+  -backend-config="bucket=myapp-shared-tfstate-724772096574" \
+  -backend-config="key=dev/terraform.tfstate" \
+  -backend-config="region=us-east-1" \
+  -backend-config="dynamodb_table=myapp-shared-tflock"
+terraform workspace select dev
+terraform destroy -var-file=environments/dev.tfvars
+```
+
+### Tearing down the backend itself
 
 If you bootstrapped the S3 backend and want to remove it too, you must first:
 
