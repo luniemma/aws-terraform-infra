@@ -372,8 +372,8 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
 
 | Event | Environment | Stages that run |
 |---|---|---|
-| PR to `main` | `dev` | validate, scan, plan (comments on PR) |
-| Push to `main` | `dev` | validate, scan, plan, apply |
+| PR to `main` / `master` | `dev` | validate, scan, plan (comments on PR) |
+| Push to `main` / `master` | `dev` | validate, scan, plan, apply |
 | `workflow_dispatch` | `dev` / `staging` / `prod` (pick) | validate, scan, plan, apply/destroy (if selected) |
 
 ### Best-practice features baked in
@@ -385,10 +385,12 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
 - **Per-environment state key** — `key=<env>/terraform.tfstate` so one bucket holds all envs safely.
 - **GitHub Environments as the approval gate** — attach required reviewers to `prod` and apply blocks on approval automatically.
 - **Workspaces match environments** — `dev`, `staging`, `prod` mapped 1:1; `environments/<env>.tfvars` is auto-selected.
-- **tfsec security scan** uploaded as SARIF (non-blocking by default).
+- **tfsec security scan** installed directly from GitHub releases (no third-party action tag drift); uploaded as SARIF (non-blocking by default). Pin with optional repo variable `TFSEC_VERSION`.
+- **Destroy action with typed confirmation** — `workflow_dispatch` only; requires typing `destroy <env>` to match the selected environment. Same plan→artifact→apply flow as a regular deploy, so reviewers see exactly what will be removed before apply runs.
 - **Upsert PR comment** — replaces the previous bot comment on each push so PRs don't fill up.
 - **`TF_IN_AUTOMATION=1`, `TF_INPUT=0`, `TF_CLI_ARGS=-no-color`** at workflow scope — no interactive prompts, no ANSI noise.
-- **Provider + module cache** keyed by `.terraform.lock.hcl` for faster init.
+- **Per-workspace provider + module cache** keyed on `terraform-version + workspace + hash(.terraform.lock.hcl, **/*.tf)`. Scoping by workspace prevents `.terraform/` from a `dev` run contaminating a `staging` init.
+- **`terraform init -reconfigure`** — CI never migrates state; it always reinitialises fresh against the backend-config for the current run. Defends against any stale backend init fingerprint in the cache.
 - **No script-injection sinks** — user-controlled inputs flow through `env:` blocks, never inline into `run:` scripts.
 - **`persist-credentials: false`** on every checkout so the `GITHUB_TOKEN` isn't left on disk.
 
@@ -428,6 +430,7 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
    | `TF_LOCK_TABLE` | `myapp-tflock` | ✅ | repo |
    | `TERRAFORM_VERSION` | `1.9.8` | optional | repo (override default) |
    | `RUNNER_IMAGE` | `ubuntu-latest` | optional | repo (e.g. self-hosted label) |
+   | `TFSEC_VERSION` | `latest` | optional | repo (e.g. `v1.28.6` to pin) |
 
 5. **Keep `environments/<env>.tfvars` in sync** with what you actually want deployed — the workflow selects the file matching the target environment.
 
@@ -464,7 +467,8 @@ Full schema in [.github/actions/terraform-deploy/action.yml](.github/actions/ter
 | `aws-role-to-assume` | ✅ | OIDC role ARN |
 | `working-directory` | | Defaults to `.` |
 | `terraform-version` | | Exact version, defaults to `1.9.8` |
-| `action` | | `plan` (default) or `apply` |
+| `action` | | `plan` (generate + upload artifact) or `apply` (download + apply artifact). Drives which CI phase the action runs. |
+| `destroy` | | `"true"` to produce a `terraform plan -destroy`. Only meaningful in the plan phase; the apply phase applies whatever the plan file contains. |
 | `var-file` | | Path relative to `working-directory` |
 | `backend-config` | | Multiline `key=value`, one per line |
 | `workspace` | | Selected or created on init |
@@ -583,6 +587,16 @@ If you bootstrapped the S3 backend and want to remove it too, you must first:
 **GitHub Actions: `Error: Could not assume role with OIDC`** — the role's trust policy `sub` condition doesn't match the repo/branch. Check the exact string GitHub sends by looking at the failed run's "Configure AWS credentials" step; it prints the token subject.
 
 **CloudWatch alarm stays in `INSUFFICIENT_DATA`** — metrics take ~5 minutes to appear on a fresh instance, and `mem_used_percent` / `disk_used_percent` require the CloudWatch agent, which runs as part of user-data. Check `/var/log/cloud-init-output.log` on the instance.
+
+**GitHub Actions: `Error: Backend configuration changed`** during `terraform init` on a new environment — happens when a provider/module cache from a previous env gets restored and holds the old backend init fingerprint. The composite action now passes `-reconfigure` and scopes the cache key by `workspace`, so this shouldn't recur. If you see it, confirm you pulled the latest [.github/actions/terraform-deploy/action.yml](.github/actions/terraform-deploy/action.yml).
+
+**GitHub Actions: `Unable to resolve action 'aquasecurity/tfsec-action@v1'`** — the upstream action stopped publishing a `v1` rolling tag. The scan job installs `tfsec` directly from GitHub releases now; pin a specific version with the repo variable `TFSEC_VERSION` (e.g. `v1.28.6`) if you want reproducibility.
+
+**GitHub Actions: plan step fails with exit code 2 but the log shows the plan succeeded** — `terraform plan -detailed-exitcode` returns `2` when there are changes. GitHub Actions runs bash steps with `-e` and `-o pipefail`, so the `2` through a `| tee` used to trip errexit before the step could handle it. Fixed in the composite action by explicitly `set +e; set -u`.
+
+**Apply fails with `iam:TagInstanceProfile` (or similar) AccessDenied** — the CI role's permission policy is missing a tagging action the AWS provider now calls. Add it to the role's inline policy. The bootstrapped policy in [gha-terraform-policy.json](gha-terraform-policy.json) covers the common set (`TagRole`/`UntagRole`/`TagInstanceProfile`/…); add more as AWS expands the provider.
+
+**Apply fails with `InvalidBlockDeviceMapping: Volume of size NGB is smaller than snapshot`** — the EC2 launch template requests a root volume smaller than the AMI's default snapshot. Amazon Linux 2023 wants `>= 30` GB. Bump `root_volume_size` in the affected `environments/<env>.tfvars`.
 
 ---
 
