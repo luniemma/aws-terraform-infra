@@ -1,4 +1,4 @@
-# terraform-aws-ec2
+# aws-terraform-infra
 
 Opinionated Terraform stack that provisions a production-shaped AWS footprint: a VPC with public and private subnets, one or more EC2 instances (Amazon Linux 2023 by default, SSM + CloudWatch agent pre-installed), and an optional EKS cluster with a managed node group. State is kept locally for quick experiments and can be migrated to a locked S3 backend for real environments.
 
@@ -53,7 +53,7 @@ IGW ◄─────┤  public subnets (10.0.1.0/24, 10.0.2.0/24)            
 ## Repository layout
 
 ```
-terraform-aws-ec2/
+aws-terraform-infra/
 ├── main.tf                  # Root module — wires VPC / EC2 / EKS together
 ├── variables.tf             # Root-level inputs
 ├── outputs.tf               # Root-level outputs
@@ -96,8 +96,8 @@ aws sts get-caller-identity
 
 ```bash
 # 1. Clone and enter the repo
-git clone <your-fork-url> terraform-aws-ec2
-cd terraform-aws-ec2
+git clone <your-fork-url> aws-terraform-infra
+cd aws-terraform-infra
 
 # 2. Create your variables file
 cp terraform.tfvars.example terraform.tfvars
@@ -451,7 +451,7 @@ aws sts get-caller-identity                      # confirm AWS creds with IAM pe
 
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export AWS_REGION=us-east-1
-export GH_REPO=OWNER/REPO                        # e.g. luniemma/terraform-aws-ec2
+export GH_REPO=OWNER/REPO                        # e.g. luniemma/aws-terraform-infra
 export PROJECT=myapp
 export ROLE_NAME=github-actions-terraform
 ```

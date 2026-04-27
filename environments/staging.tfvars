@@ -3,7 +3,7 @@
 ################################################################################
 
 aws_region   = "us-east-1"
-project_name = "myapp"
+project_name = "codeplex"
 environment  = "staging"
 
 # Network
