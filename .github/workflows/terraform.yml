@@ -9,6 +9,9 @@ name: Terraform
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
+  schedule:
+    # 06:00 UTC = 00:00 CST (winter) / 01:00 CDT (summer). GitHub cron is UTC only and does not honour DST.
+    - cron: "0 6 * * *"
   pull_request:
     branches: [main, master]
     paths: &tf-paths
@@ -83,6 +86,7 @@ jobs:
           case "${EVENT}" in
             pull_request)      env="dev"; action="plan" ;;
             push)              env="dev"; action="apply" ;;
+            schedule)          env="dev"; action="plan" ;;
             workflow_dispatch) env="${INPUT_ENV}"; action="${INPUT_ACTION}" ;;
             *) echo "::error::Unsupported event: ${EVENT}"; exit 1 ;;
           esac
@@ -102,6 +106,27 @@ jobs:
             apply|destroy) run_apply=true ;;
             *)             run_apply=false ;;
           esac
+
+          echo "::group::Resolved configuration"
+          echo "Trigger:     ${EVENT}"
+          echo "Environment: ${env}"
+          echo "Action:      ${action}"
+          echo "Var file:    environments/${env}.tfvars"
+          echo "Run apply:   ${run_apply}"
+          echo "::endgroup::"
+          echo "::notice title=Terraform run::env=${env} action=${action} (trigger=${EVENT})"
+
+          {
+            echo "### Terraform run configuration"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Trigger | \`${EVENT}\` |"
+            echo "| Environment | \`${env}\` |"
+            echo "| Action | \`${action}\` |"
+            echo "| Var file | \`environments/${env}.tfvars\` |"
+            echo "| Run apply | \`${run_apply}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
           echo "environment=${env}"                  >> "${GITHUB_OUTPUT}"
           echo "action=${action}"                    >> "${GITHUB_OUTPUT}"
@@ -197,6 +222,23 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Print plan context
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ needs.config.outputs.environment }}
+          ACTION:      ${{ needs.config.outputs.action }}
+          TFVARS:      ${{ needs.config.outputs.tfvars }}
+          BUCKET:      ${{ vars.TF_STATE_BUCKET }}
+          REGION:      ${{ vars.AWS_REGION }}
+        run: |
+          echo "::group::Plan context"
+          echo "Environment: ${ENVIRONMENT}"
+          echo "Action:      ${ACTION}"
+          echo "Var file:    ${TFVARS}"
+          echo "Workspace:   ${ENVIRONMENT}"
+          echo "State:       s3://${BUCKET}/${ENVIRONMENT}/terraform.tfstate (${REGION})"
+          echo "::endgroup::"
+
       - name: Terraform plan
         id: tf
         uses: ./.github/actions/terraform-deploy
@@ -217,6 +259,35 @@ jobs:
             region=${{ vars.AWS_REGION }}
             dynamodb_table=${{ vars.TF_LOCK_TABLE }}
             encrypt=true
+
+      - name: Plan summary
+        if: always()
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ needs.config.outputs.environment }}
+          ACTION:      ${{ needs.config.outputs.action }}
+          EXITCODE:    ${{ steps.tf.outputs.plan-exitcode }}
+          SUMMARY:     ${{ steps.tf.outputs.plan-summary }}
+        run: |
+          case "${EXITCODE:-?}" in
+            0) status="No changes" ;;
+            2) status="Changes detected" ;;
+            *) status="Plan failed (exit ${EXITCODE:-?})" ;;
+          esac
+          {
+            echo "### Terraform plan — \`${ENVIRONMENT}\` (${ACTION})"
+            echo ""
+            echo "- **Status:** ${status}"
+            echo "- **Trigger:** \`${GITHUB_EVENT_NAME}\`"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            if [ -n "${SUMMARY:-}" ]; then
+              echo ""
+              echo '```'
+              echo "${SUMMARY}"
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::notice title=Terraform plan::${ENVIRONMENT} (${ACTION}) — ${status}"
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
@@ -301,7 +372,26 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Print apply context
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ needs.config.outputs.environment }}
+          ACTION:      ${{ needs.config.outputs.action }}
+          TFVARS:      ${{ needs.config.outputs.tfvars }}
+          BUCKET:      ${{ vars.TF_STATE_BUCKET }}
+          REGION:      ${{ vars.AWS_REGION }}
+        run: |
+          echo "::group::Apply context"
+          echo "Environment:  ${ENVIRONMENT}"
+          echo "Action:       ${ACTION}"
+          echo "Var file:     ${TFVARS}"
+          echo "Workspace:    ${ENVIRONMENT}"
+          echo "Plan artifact: tfplan-${ENVIRONMENT}-${GITHUB_RUN_ID}"
+          echo "State:        s3://${BUCKET}/${ENVIRONMENT}/terraform.tfstate (${REGION})"
+          echo "::endgroup::"
+
       - name: Terraform apply
+        id: tf
         uses: ./.github/actions/terraform-deploy
         with:
           working-directory: .
@@ -320,3 +410,20 @@ jobs:
             region=${{ vars.AWS_REGION }}
             dynamodb_table=${{ vars.TF_LOCK_TABLE }}
             encrypt=true
+
+      - name: Apply summary
+        if: always()
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ needs.config.outputs.environment }}
+          ACTION:      ${{ needs.config.outputs.action }}
+          OUTCOME:     ${{ steps.tf.outcome }}
+        run: |
+          {
+            echo "### Terraform ${ACTION} — \`${ENVIRONMENT}\`"
+            echo ""
+            echo "- **Outcome:** \`${OUTCOME}\`"
+            echo "- **Trigger:** \`${GITHUB_EVENT_NAME}\`"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::notice title=Terraform ${ACTION}::${ENVIRONMENT} — ${OUTCOME}"

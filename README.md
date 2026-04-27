@@ -438,6 +438,153 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
 
 7. **Push a PR.** The workflow will plan against `dev` and upsert a comment.
 
+### Bootstrap with `gh` and `aws` CLIs
+
+End-to-end commands for the OIDC trust, IAM role, GitHub Environments, and variables described in the [Setup checklist](#setup-checklist). With OIDC there are **no AWS access keys** stored in GitHub — only an IAM role ARN, which lives in `gh variable` (not `gh secret`).
+
+#### 0. Prereqs and shell variables
+
+```bash
+gh auth login                                    # authenticate the GitHub CLI (needs `repo` + `workflow` scopes)
+gh auth status                                   # confirm scopes
+aws sts get-caller-identity                      # confirm AWS creds with IAM permissions
+
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export AWS_REGION=us-east-1
+export GH_REPO=OWNER/REPO                        # e.g. luniemma/terraform-aws-ec2
+export PROJECT=myapp
+export ROLE_NAME=github-actions-terraform
+```
+
+#### 1. Create the GitHub OIDC provider in AWS (once per AWS account)
+
+GitHub mints OIDC ID tokens for each workflow run; AWS STS exchanges them for temporary credentials. The provider is the trust anchor for that exchange. Skip this if `aws iam list-open-id-connect-providers` already shows `token.actions.githubusercontent.com`.
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+```
+
+> AWS now verifies the full TLS chain, so the thumbprint is essentially advisory — the value above is GitHub's published root. `EntityAlreadyExists` is fine: you only need one per account.
+
+#### 2. Create the IAM role Terraform will assume
+
+The `sub` condition restricts the role to *this* repo. To narrow further (e.g., one role usable only from the `prod` environment), change the pattern — see [GitHub's OIDC token docs](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#understanding-the-oidc-token).
+
+```bash
+cat > /tmp/trust.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:${GH_REPO}:*" }
+    }
+  }]
+}
+EOF
+
+aws iam create-role \
+  --role-name "${ROLE_NAME}" \
+  --assume-role-policy-document file:///tmp/trust.json
+```
+
+Attach a permission policy. The bundled [gha-terraform-policy.json](gha-terraform-policy.json) covers the VPC/EC2/IAM/CloudWatch + state-bucket actions Terraform calls in this repo:
+
+```bash
+aws iam put-role-policy \
+  --role-name "${ROLE_NAME}" \
+  --policy-name terraform-deploy \
+  --policy-document file://gha-terraform-policy.json
+
+export AWS_ROLE_ARN=$(aws iam get-role --role-name "${ROLE_NAME}" --query Role.Arn --output text)
+echo "$AWS_ROLE_ARN"
+```
+
+For quick experimentation, the AWS-managed broad policies work too:
+
+```bash
+for p in AmazonEC2FullAccess AmazonVPCFullAccess IAMFullAccess; do
+  aws iam attach-role-policy --role-name "${ROLE_NAME}" \
+    --policy-arn "arn:aws:iam::aws:policy/${p}"
+done
+```
+
+For real environments, create one role per env (`github-actions-terraform-dev`, `…-staging`, `…-prod`) and tighten the trust policy's `sub` condition per env, e.g. `repo:${GH_REPO}:environment:prod`.
+
+#### 3. Create the three GitHub Environments
+
+There's no first-class `gh environment` subcommand, so we drive the REST API:
+
+```bash
+for env in dev staging prod; do
+  gh api -X PUT "repos/${GH_REPO}/environments/${env}"
+done
+```
+
+Add required reviewers on `prod` so apply pauses for human approval. Get the reviewer's numeric ID first (`gh api users/<login> --jq .id`), then:
+
+```bash
+cat <<EOF | gh api -X PUT "repos/${GH_REPO}/environments/prod" --input -
+{
+  "wait_timer": 0,
+  "prevent_self_review": true,
+  "reviewers": [
+    { "type": "User", "id": <USER_ID> }
+  ]
+}
+EOF
+```
+
+Use `"type": "Team"` and the team ID instead to gate by team.
+
+#### 4. Set repo-level variables (shared across envs)
+
+```bash
+gh variable set AWS_REGION        --repo "${GH_REPO}" --body "${AWS_REGION}"
+gh variable set TF_STATE_BUCKET   --repo "${GH_REPO}" --body "${PROJECT}-tfstate-${AWS_ACCOUNT_ID}"
+gh variable set TF_LOCK_TABLE     --repo "${GH_REPO}" --body "${PROJECT}-tflock"
+gh variable set TERRAFORM_VERSION --repo "${GH_REPO}" --body "1.9.8"   # optional override
+```
+
+Confirm: `gh variable list --repo "${GH_REPO}"`.
+
+#### 5. Set per-environment variables (one role ARN per env)
+
+Per-env values override repo-level ones, so each env can also pin its own region or state bucket if envs live in separate AWS accounts.
+
+```bash
+gh variable set AWS_ROLE_ARN --repo "${GH_REPO}" --env dev     --body "<dev-role-arn>"
+gh variable set AWS_ROLE_ARN --repo "${GH_REPO}" --env staging --body "<staging-role-arn>"
+gh variable set AWS_ROLE_ARN --repo "${GH_REPO}" --env prod    --body "<prod-role-arn>"
+```
+
+Confirm per-env: `gh variable list --repo "${GH_REPO}" --env dev`.
+
+#### 6. Why no `gh secret` calls
+
+The role ARN is a public-by-design identifier, not a credential — variables are correct. The only credential AWS issues here is the short-lived STS session minted at run time from the OIDC ID token, and that never touches GitHub. If you ever fall back to static keys (please don't), they'd go in `gh secret` and be scoped per env:
+
+```bash
+gh secret set AWS_ACCESS_KEY_ID     --repo "${GH_REPO}" --env dev
+gh secret set AWS_SECRET_ACCESS_KEY --repo "${GH_REPO}" --env dev
+```
+
+#### 7. Verify the wiring with a dry-run
+
+```bash
+gh workflow run terraform.yml --repo "${GH_REPO}" --ref master \
+  -f environment=dev -f action=plan
+gh run watch --repo "${GH_REPO}"
+```
+
+A successful plan run confirms OIDC trust, role permissions, state-bucket access, and the variable wiring all work end-to-end.
+
 ### Consuming the composite action from another repo
 
 ```yaml
