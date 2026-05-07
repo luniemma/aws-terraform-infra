@@ -51,7 +51,7 @@ resource "aws_subnet" "public" {
     },
     var.enable_eks ? {
       "kubernetes.io/role/elb"                                           = "1"
-      "kubernetes.io/cluster/${var.project_name}-${var.environment}-eks" = "shared"
+      "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
     } : {}
   )
 }
@@ -70,7 +70,7 @@ resource "aws_subnet" "private" {
     },
     var.enable_eks ? {
       "kubernetes.io/role/internal-elb"                                  = "1"
-      "kubernetes.io/cluster/${var.project_name}-${var.environment}-eks" = "shared"
+      "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
     } : {}
   )
 }
