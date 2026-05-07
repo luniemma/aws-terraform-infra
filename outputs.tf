@@ -70,3 +70,9 @@ output "eks_kubeconfig_command" {
   description = "Command to update kubeconfig"
   value       = module.eks.cluster_kubeconfig_command
 }
+
+# App deploy access
+output "app_deploy_role_arn" {
+  description = "IAM role ARN for the app repo's deploy workflow. Set on the app repo as the AWS_DEPLOY_ROLE_ARN secret."
+  value       = aws_iam_role.app_deploy.arn
+}

@@ -91,3 +91,89 @@ module "eks" {
   node_min_size                   = var.eks_node_min_size
   node_max_size                   = var.eks_node_max_size
 }
+
+################################################################################
+# App deploy access
+#
+# IAM role assumed via OIDC by the app repo's deploy workflow (set as the app
+# repo's AWS_DEPLOY_ROLE_ARN secret). Permissions are intentionally minimal at
+# the IAM layer (just eks:DescribeCluster) — actual cluster authority is granted
+# via an EKS access entry mapped to AmazonEKSClusterAdminPolicy below.
+#
+# Reuses the GitHub Actions OIDC provider that already exists in this account
+# (the same one the terraform CI role uses). Looking it up by URL lets us avoid
+# managing it in this stack.
+################################################################################
+
+data "aws_iam_openid_connect_provider" "github_actions" {
+  url = "https://token.actions.githubusercontent.com"
+}
+
+data "aws_iam_policy_document" "app_deploy_assume_role" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [data.aws_iam_openid_connect_provider.github_actions.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.app_repo}:*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "app_deploy" {
+  name               = "${var.project_name}-app-deploy"
+  description        = "Assumed via OIDC by ${var.app_repo} deploy workflow"
+  assume_role_policy = data.aws_iam_policy_document.app_deploy_assume_role.json
+
+  tags = {
+    Name = "${var.project_name}-app-deploy"
+  }
+}
+
+# Minimal AWS-side perms — just enough for `aws eks update-kubeconfig`.
+resource "aws_iam_role_policy" "app_deploy_eks" {
+  name = "eks-describe"
+  role = aws_iam_role.app_deploy.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "eks:DescribeCluster"
+      Resource = module.eks.cluster_arn
+    }]
+  })
+}
+
+# Cluster-side authority. AmazonEKSClusterAdminPolicy is the simplest scope —
+# tighten to AmazonEKSAdminPolicy + namespace-scoped binding when you have time.
+resource "aws_eks_access_entry" "app_deploy" {
+  cluster_name  = module.eks.cluster_name
+  principal_arn = aws_iam_role.app_deploy.arn
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "app_deploy_admin" {
+  cluster_name  = module.eks.cluster_name
+  principal_arn = aws_iam_role.app_deploy.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+
+  depends_on = [aws_eks_access_entry.app_deploy]
+}

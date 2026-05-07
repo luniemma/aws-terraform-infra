@@ -110,3 +110,13 @@ variable "eks_node_max_size" {
   type        = number
   default     = 4
 }
+
+################################################################################
+# App deploy access — cross-repo IAM role for the app's CI
+################################################################################
+
+variable "app_repo" {
+  description = "owner/name of the app repo whose deploy workflow assumes app_deploy_role via OIDC"
+  type        = string
+  default     = "luniemma/codeplex-application-ai-systhem"
+}
