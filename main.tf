@@ -60,6 +60,16 @@ module "vpc" {
 # EKS Module
 ################################################################################
 
+# Defensive: the module previously used `count = var.enable_eks ? 1 : 0`, which
+# addressed resources as `module.eks[0].*`. If anyone wraps the module in count
+# again later, this `moved` block rewires state in place rather than forcing a
+# destroy+create of the cluster (which is what happens when terraform sees the
+# addresses as different resources).
+moved {
+  from = module.eks[0]
+  to   = module.eks
+}
+
 module "eks" {
   source = "./modules/eks"
 
