@@ -101,13 +101,18 @@ module "eks" {
 # via an EKS access entry mapped to AmazonEKSClusterAdminPolicy below.
 #
 # Reuses the GitHub Actions OIDC provider that already exists in this account
-# (the same one the terraform CI role uses). Looking it up by URL lets us avoid
-# managing it in this stack.
+# (the same one the terraform CI role uses). The ARN is deterministic, so we
+# build it from the caller's account ID instead of looking it up — that avoids
+# needing iam:ListOpenIDConnectProviders on the terraform CI role.
 ################################################################################
 
-data "aws_iam_openid_connect_provider" "github_actions" {
-  url = "https://token.actions.githubusercontent.com"
+data "aws_caller_identity" "current" {}
+
+locals {
+  github_oidc_provider_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
 }
+
+data "aws_partition" "current" {}
 
 data "aws_iam_policy_document" "app_deploy_assume_role" {
   statement {
@@ -116,7 +121,7 @@ data "aws_iam_policy_document" "app_deploy_assume_role" {
 
     principals {
       type        = "Federated"
-      identifiers = [data.aws_iam_openid_connect_provider.github_actions.arn]
+      identifiers = [local.github_oidc_provider_arn]
     }
 
     condition {
