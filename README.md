@@ -39,11 +39,15 @@ After a successful `apply`, the workflow fires a `repository_dispatch` at the ap
 
 | Component | Details |
 |---|---|
-| **VPC** | `/16` with public and private `/24` subnets across 2 AZs, IGW, NAT GW |
-| **EKS cluster** | `codeplex-eks` — managed control plane, configurable Kubernetes version, control-plane logs to CloudWatch (`api`, `audit`, `authenticator`) |
-| **Managed node group** | Worker nodes in private subnets; configurable instance types, capacity type (ON_DEMAND or SPOT), disk size, autoscaling bounds |
-| **OIDC provider** | For IAM Roles for Service Accounts (IRSA) — pods can assume IAM roles without static credentials |
-| **Bootstrap module** | Separate stack to create a versioned/encrypted S3 state bucket + DynamoDB lock table |
+| **VPC** | `/16` with public and private `/24` subnets across 2 AZs, IGW, NAT GW. Subnets pre-tagged for ELB discovery (`kubernetes.io/role/elb`, `kubernetes.io/cluster/<name>: shared`). |
+| **EKS cluster** | `codeplex-eks` — managed control plane, configurable Kubernetes version, control-plane logs to CloudWatch (`api`, `audit`, `authenticator`). Auth mode `API_AND_CONFIG_MAP`. |
+| **Managed node group** | Worker nodes in private subnets; configurable instance types, capacity type (ON_DEMAND or SPOT), disk size, autoscaling bounds. |
+| **OIDC provider** | For IAM Roles for Service Accounts (IRSA) — pods can assume IAM roles without static credentials. |
+| **App-deploy IAM role** | `codeplex-app-deploy` — assumed by the app repo's deploy workflow via OIDC. Inline policy grants `eks:DescribeCluster`; cluster authority via EKS access entry mapped to `AmazonEKSClusterAdminPolicy`. |
+| **Cluster admin access entries** | Driver-side `cluster_admin_principals` list — IAM users/roles get cluster-admin via EKS access entry. Survives destroy/apply, no manual `aws-cli` step. |
+| **nginx-ingress controller** | Installed as a `helm_release` (chart `4.11.3`). Single LoadBalancer-backed ingress controller; per-env `Ingress` objects share its NLB. |
+| **Trigger app deploy** | Post-apply, `terraform.yml` POSTs `repository_dispatch: deploy-app` at the app repo (when `APP_REPO` + `APP_REPO_TOKEN` are set). |
+| **Bootstrap module** | Separate stack to create a versioned/encrypted S3 state bucket + DynamoDB lock table. |
 
 App envs (`dev`, `qa`, `staging`, `prod`) are k8s namespaces deployed by the [app repo](https://github.com/luniemma/codeplex-application-ai-systhem) — not separate AWS stacks.
 
@@ -53,19 +57,25 @@ App envs (`dev`, `qa`, `staging`, `prod`) are k8s namespaces deployed by the [ap
 
 ```
 aws-terraform-infra/
-├── main.tf                  # Root module — wires VPC + EKS together
-├── variables.tf             # Root-level inputs
-├── outputs.tf               # Root-level outputs
+├── main.tf                  # Root — wires VPC + EKS, app-deploy role + access
+│                            #   entries, nginx-ingress helm_release, k8s/helm
+│                            #   providers (auth via `aws eks get-token` exec)
+├── variables.tf             # Root-level inputs (incl. cluster_admin_principals,
+│                            #   app_repo)
+├── outputs.tf               # Root outputs (incl. app_deploy_role_arn for the
+│                            #   app repo's AWS_DEPLOY_ROLE_ARN secret)
 ├── environments/
 │   └── platform.tfvars      # The only stack — provisions the shared EKS cluster
 ├── backend/
 │   └── main.tf              # One-time bootstrap for S3 + DynamoDB backend
 ├── modules/
-│   ├── vpc/                 # VPC, subnets, IGW, NAT, route tables
+│   ├── vpc/                 # VPC, subnets, IGW, NAT, route tables.
+│   │                        #   Subnets tagged for ELB discovery.
 │   └── eks/                 # EKS cluster + managed node group + OIDC provider
 └── .github/
     ├── actions/terraform-deploy/  # Reusable composite action
-    └── workflows/terraform.yml    # validate → scan → plan → apply pipeline
+    └── workflows/terraform.yml    # validate → scan → plan → apply →
+                                   # trigger_app_deploy → app repo dispatch
 ```
 
 ---
@@ -161,6 +171,13 @@ NAT Gateway is always on — EKS nodes in private subnets need outbound for ECR 
 | `eks_node_disk_size` | `50` |
 | `eks_node_desired_size` / `min_size` / `max_size` | `2` / `1` / `4` |
 
+### Access + cross-repo
+
+| Name | Default | Notes |
+|---|---|---|
+| `app_repo` | `luniemma/codeplex-application-ai-systhem` | OIDC trust subject for `codeplex-app-deploy` role |
+| `cluster_admin_principals` | `["arn:aws:iam::724772096574:user/terra-project"]` | List of IAM principal ARNs that get `AmazonEKSClusterAdminPolicy` via EKS access entry. Add team members here to give them `kubectl` access without manual CLI steps. |
+
 ---
 
 ## Outputs reference
@@ -177,6 +194,7 @@ Defined in [outputs.tf](outputs.tf):
 | `eks_cluster_version` | Kubernetes version |
 | `eks_oidc_provider_arn` | For IRSA trust policies |
 | `eks_kubeconfig_command` | Ready-to-paste `aws eks update-kubeconfig …` |
+| `app_deploy_role_arn` | IAM role for the app repo's deploy workflow. Set on the app repo as the `AWS_DEPLOY_ROLE_ARN` secret. |
 
 ```bash
 terraform output -raw eks_kubeconfig_command
@@ -323,6 +341,16 @@ Tearing the cluster down also tears down the VPC and NAT Gateway, so this is a c
 **`Error: error creating EKS Cluster: ResourceInUseException`** — a cluster with the same name (`codeplex-eks`) already exists in the region. Either import it, destroy the existing one, or change `project_name`.
 
 **`Error: Backend configuration changed`** during `terraform init` on a new run — happens when a module cache from a previous init gets restored and holds the old backend init fingerprint. The composite action passes `-reconfigure` and scopes the cache key, so this shouldn't recur. If you see it, confirm you have the latest [.github/actions/terraform-deploy/action.yml](.github/actions/terraform-deploy/action.yml).
+
+**`could not find any suitable subnets for creating the ELB`** — the public subnets aren't tagged for ELB discovery. The VPC module sets `kubernetes.io/role/elb: "1"` and `kubernetes.io/cluster/${project_name}-eks: shared`. If the cluster name and tag drift apart (e.g. after renaming `project_name`), the cloud provider can't find subnets. Re-apply, or `aws ec2 create-tags` against the public subnets to match.
+
+**`OperationNotPermitted: This AWS account currently does not support creating load balancers`** — account-level restriction common on new AWS accounts. Open a Support ticket asking to enable Elastic Load Balancer creation. Until then, the nginx-ingress controller's Service stays `Pending` for `EXTERNAL-IP` and the app repo's deploy summary falls back to `kubectl port-forward` commands.
+
+**`Error: creating IAM Role: EntityAlreadyExists`** when re-applying after a destroy — IAM role names linger briefly after deletion (eventual consistency). Wait 30–60s and re-run apply; the names will be free.
+
+**helm provider hangs on destroy** — if you destroy the cluster while `helm_release.ingress_nginx` is still in state, terraform tries to talk to a dead API server. Workaround: `terraform state rm helm_release.ingress_nginx` before destroy, or destroy via `gh workflow run … -f action=destroy` (the workflow handles it).
+
+**Local kubectl returns `the server has asked for the client to provide credentials`** — your IAM principal isn't in the cluster's access entries. Add it to `cluster_admin_principals` in [variables.tf](variables.tf) (or [environments/platform.tfvars](environments/platform.tfvars)) and re-apply, or temporarily `aws eks create-access-entry` + `aws eks associate-access-policy` via CLI (will drift terraform state).
 
 **`UnauthorizedOperation` from `aws-actions/configure-aws-credentials`** — OIDC trust policy doesn't match the workflow's repo/branch. Check `token.actions.githubusercontent.com:sub` in the role trust policy against `repo:<owner>/<repo>:*`.
 
