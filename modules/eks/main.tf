@@ -6,7 +6,10 @@ data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
 locals {
-  cluster_name = "${var.project_name}-${var.environment}-eks"
+  # One cluster shared across environments. Per-env isolation is provided by
+  # Kubernetes namespaces (e.g. codeplex-dev, codeplex-qa, codeplex-prod), not
+  # by separate clusters.
+  cluster_name = "${var.project_name}-eks"
 }
 
 ################################################################################

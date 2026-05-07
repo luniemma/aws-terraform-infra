@@ -30,5 +30,5 @@ root_volume_type = "gp3"
 enable_detailed_monitoring = false
 cpu_alarm_threshold        = 80
 
-# EKS (off for dev by default)
+# EKS — owned by environments/platform.tfvars (single shared cluster). Off here.
 enable_eks = false

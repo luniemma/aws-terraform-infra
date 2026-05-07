@@ -27,11 +27,11 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: Target environment
+        description: Target environment ('platform' provisions the shared EKS cluster)
         required: true
         default: dev
         type: choice
-        options: [dev, staging, prod]
+        options: [dev, staging, prod, platform]
       action:
         description: plan / apply / destroy
         required: true
@@ -427,3 +427,74 @@ jobs:
             echo "- **Commit:** \`${GITHUB_SHA}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
           echo "::notice title=Terraform ${ACTION}::${ENVIRONMENT} — ${OUTCOME}"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Trigger the app repo's deploy workflow after a successful `apply` on the
+  # shared cluster (environment = platform). The app repo's deploy.yml has a
+  # `repository_dispatch: types: [deploy-app]` listener that auto-applies to
+  # the dev namespace; qa/staging/prod still go through manual workflow_dispatch
+  # with required reviewers.
+  #
+  # Required repo configuration:
+  #   * Variable APP_REPO        — "owner/name" of the app repo (e.g. luniemma/codeplex-application-ai-systhem)
+  #   * Secret   APP_REPO_TOKEN  — fine-grained PAT scoped to APP_REPO with `contents: write`
+  #                                (or a GitHub App token mintable for that repo)
+  # If either is unset the job no-ops with a clear notice instead of failing.
+  # ────────────────────────────────────────────────────────────────────────────
+  trigger_app_deploy:
+    name: Trigger app deploy (dev)
+    needs: [config, apply]
+    if: |
+      needs.config.outputs.run-apply == 'true' &&
+      needs.config.outputs.action == 'apply' &&
+      needs.config.outputs.environment == 'platform'
+    runs-on: ${{ vars.RUNNER_IMAGE || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Dispatch deploy-app to ${{ vars.APP_REPO }}
+        shell: bash
+        env:
+          APP_REPO:   ${{ vars.APP_REPO }}
+          APP_TOKEN:  ${{ secrets.APP_REPO_TOKEN }}
+          INFRA_RUN:  ${{ github.run_id }}
+          INFRA_REPO: ${{ github.repository }}
+          ACTOR:      ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APP_REPO:-}" || -z "${APP_TOKEN:-}" ]]; then
+            echo "::notice::APP_REPO variable or APP_REPO_TOKEN secret unset — skipping app dispatch."
+            echo "::notice::Set repo Variable APP_REPO=<owner/name> and Secret APP_REPO_TOKEN=<PAT> to enable."
+            exit 0
+          fi
+
+          payload=$(jq -nc \
+            --arg env "dev" \
+            --arg method "helm" \
+            --arg by "$ACTOR" \
+            --arg from "$INFRA_REPO" \
+            --arg run "$INFRA_RUN" \
+            --arg url "${GITHUB_SERVER_URL}/${INFRA_REPO}/actions/runs/${INFRA_RUN}" \
+            '{event_type:"deploy-app", client_payload:{environment:$env, method:$method, triggered_by:$by, triggered_from:$from, infrastructure_run:$run, infrastructure_run_url:$url}}')
+
+          http=$(curl -sS -o /tmp/resp -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${APP_REPO}/dispatches" \
+            -d "$payload")
+
+          if [[ "$http" != "204" ]]; then
+            echo "::error::repository_dispatch to ${APP_REPO} failed (HTTP $http)"
+            cat /tmp/resp || true
+            exit 1
+          fi
+          echo "::notice title=App deploy dispatched::${APP_REPO} (deploy-app → dev)"
+          {
+            echo "### App deploy dispatched"
+            echo ""
+            echo "- **Repo:** \`${APP_REPO}\`"
+            echo "- **Event:** \`deploy-app\` → environment \`dev\`"
+            echo "- **Triggered by infra run:** [${INFRA_RUN}](${GITHUB_SERVER_URL}/${INFRA_REPO}/actions/runs/${INFRA_RUN})"
+          } >> "${GITHUB_STEP_SUMMARY}"

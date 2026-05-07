@@ -31,12 +31,5 @@ enable_detailed_monitoring = true
 cpu_alarm_threshold        = 70
 # alarm_sns_topic_arn      = "arn:aws:sns:us-east-1:123456789012:prod-alerts"
 
-# EKS
-enable_eks              = true
-eks_cluster_version     = "1.31"
-eks_node_instance_types = ["t3.large"]
-eks_node_capacity_type  = "ON_DEMAND"
-eks_node_disk_size      = 100
-eks_node_desired_size   = 3
-eks_node_min_size       = 2
-eks_node_max_size       = 6
+# EKS — owned by environments/platform.tfvars (single shared cluster). Off here.
+enable_eks = false

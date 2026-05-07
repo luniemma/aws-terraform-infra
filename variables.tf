@@ -15,13 +15,13 @@ variable "project_name" {
 }
 
 variable "environment" {
-  description = "Environment name (e.g. dev, staging, prod)"
+  description = "Environment name (e.g. dev, staging, prod, or 'platform' for the shared EKS stack)"
   type        = string
   default     = "dev"
 
   validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "Environment must be one of: dev, staging, prod."
+    condition     = contains(["dev", "staging", "prod", "platform"], var.environment)
+    error_message = "Environment must be one of: dev, staging, prod, platform."
   }
 }
 

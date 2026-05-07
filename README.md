@@ -1,6 +1,8 @@
 # aws-terraform-infra
 
-Opinionated Terraform stack that provisions a production-shaped AWS footprint: a VPC with public and private subnets, one or more EC2 instances (Amazon Linux 2023 by default, SSM + CloudWatch agent pre-installed), and an optional EKS cluster with a managed node group. State is kept locally for quick experiments and can be migrated to a locked S3 backend for real environments.
+Opinionated Terraform stack that provisions a production-shaped AWS footprint: a VPC with public and private subnets, one or more EC2 instances (Amazon Linux 2023 by default, SSM + CloudWatch agent pre-installed), and a **single shared EKS cluster** (provisioned by the dedicated `platform` stack) that hosts every app environment as a separate Kubernetes namespace. State is kept locally for quick experiments and can be migrated to a locked S3 backend for real environments.
+
+> **Topology:** one cluster, namespace per env. `environments/platform.tfvars` owns the cluster (`codeplex-eks`); `dev.tfvars`, `staging.tfvars`, `prod.tfvars` provision per-env VPC + EC2 only (`enable_eks=false`). App workloads land in `codeplex-dev`, `codeplex-qa`, `codeplex-staging`, `codeplex-prod` namespaces inside the shared cluster. After a successful `apply` on the `platform` stack, the workflow fires a `repository_dispatch` at the app repo so the app deploys automatically into the `dev` namespace — see [Triggering app deploy after cluster apply](#triggering-app-deploy-after-cluster-apply).
 
 ```
           ┌─────────────────────── VPC (10.0.0.0/16) ──────────────────────┐
@@ -25,7 +27,8 @@ IGW ◄─────┤  public subnets (10.0.1.0/24, 10.0.2.0/24)            
 4. [Quick start (local state)](#quick-start-local-state)
 5. [Step-by-step walkthrough](#step-by-step-walkthrough)
 6. [Remote state on S3 + DynamoDB](#remote-state-on-s3--dynamodb)
-7. [Enabling EKS](#enabling-eks)
+7. [The platform stack (shared EKS cluster)](#the-platform-stack-shared-eks-cluster)
+   - [Triggering app deploy after cluster apply](#triggering-app-deploy-after-cluster-apply)
 8. [Variables reference](#variables-reference)
 9. [Outputs reference](#outputs-reference)
 10. [GitHub Actions deployment](#github-actions-deployment)
@@ -45,7 +48,7 @@ IGW ◄─────┤  public subnets (10.0.1.0/24, 10.0.2.0/24)            
 | **IAM** | EC2 instance profile with `AmazonSSMManagedInstanceCore` + CloudWatch Agent policy |
 | **Observability** | CloudWatch agent for memory/disk metrics + `/var/log/messages` & `cloud-init` log shipping, CPU alarm |
 | **Security Group** | Port 22 open only to `allowed_ssh_cidrs` (leave empty to disable SSH and use SSM) |
-| **EKS (optional)** | Managed control plane + managed node group in private subnets, OIDC provider for IRSA |
+| **EKS (shared cluster)** | One `codeplex-eks` cluster owned by the `platform` stack; managed control plane + managed node group in private subnets, OIDC provider for IRSA. App envs are k8s namespaces inside this cluster — `codeplex-dev`, `codeplex-qa`, `codeplex-staging`, `codeplex-prod`. |
 | **Bootstrap module** | Separate stack to create a versioned/encrypted S3 state bucket + DynamoDB lock table |
 
 ---
@@ -60,9 +63,10 @@ aws-terraform-infra/
 ├── userdata.sh              # EC2 bootstrap: SSM, CloudWatch agent, hostname
 ├── terraform.tfvars.example # Copy → terraform.tfvars for local runs
 ├── environments/            # Per-env variable files consumed by CI
-│   ├── dev.tfvars
-│   ├── staging.tfvars
-│   └── prod.tfvars
+│   ├── platform.tfvars      # Owns the SHARED EKS cluster (enable_eks=true here only)
+│   ├── dev.tfvars           # VPC + EC2 only; enable_eks=false
+│   ├── staging.tfvars       # VPC + EC2 only; enable_eks=false
+│   └── prod.tfvars          # VPC + EC2 only; enable_eks=false
 ├── backend/
 │   └── main.tf              # One-time bootstrap for S3 + DynamoDB backend
 ├── modules/
@@ -245,29 +249,46 @@ From this point on, `plan` and `apply` read and write state through S3 with Dyna
 
 ---
 
-## Enabling EKS
+## The platform stack (shared EKS cluster)
 
-EKS is off by default (`enable_eks = false`). To turn it on, add to [terraform.tfvars](terraform.tfvars):
+EKS lives in a dedicated stack — [environments/platform.tfvars](environments/platform.tfvars) — so a single `codeplex-eks` cluster is shared across every app environment. Per-env stacks (`dev`, `staging`, `prod`) only manage VPC + EC2 and keep `enable_eks = false`.
 
-```hcl
-enable_eks              = true
-enable_nat_gateway      = true     # forced on when enable_eks=true, but be explicit
-eks_cluster_version     = "1.31"
-eks_node_instance_types = ["t3.medium"]
-eks_node_desired_size   = 2
-eks_node_min_size       = 1
-eks_node_max_size       = 4
-```
+Why split it out:
 
-Apply, then hook up `kubectl`:
+- **One control plane to pay for.** The cluster is the most expensive line item; running one shared cluster instead of three saves ~$150/month versus a per-env cluster topology.
+- **Independent lifecycle.** You can rebuild a per-env VPC without touching the cluster, and upgrade the cluster's Kubernetes version without rolling any per-env state.
+- **Soft isolation via namespaces.** App envs land in `codeplex-dev`, `codeplex-qa`, `codeplex-staging`, `codeplex-prod` — same cluster, different namespaces. Layer on `ResourceQuotas`, dedicated node groups for prod (taints + tolerations), and `NetworkPolicies` if non-prod noisy-neighbour risk to prod is a concern.
+
+### Provisioning the cluster
+
+Locally:
 
 ```bash
-terraform apply
+terraform init
+terraform workspace select platform || terraform workspace new platform
+terraform apply -var-file=environments/platform.tfvars
 eval "$(terraform output -raw eks_kubeconfig_command)"
 kubectl get nodes
 ```
 
-> NAT Gateway + EKS control plane + 2× `t3.medium` nodes runs around **USD $100–150 / month**. Don't leave it on.
+Or via CI: trigger [terraform.yml](.github/workflows/terraform.yml) with `workflow_dispatch` and pick `environment: platform`, `action: apply`.
+
+### Triggering app deploy after cluster apply
+
+After a successful `apply` on the `platform` env, a follow-up job in the workflow (`trigger_app_deploy`) fires a `repository_dispatch` at the app repo with `event-type: deploy-app` and `client_payload.environment: dev`. The app repo's `deploy.yml` accepts that dispatch and runs a Helm deploy into the `codeplex-dev` namespace on the shared cluster — so a fresh cluster comes up with the app already running.
+
+To enable that dispatch, add **two** values to this repo's settings (Settings → Secrets and variables → Actions):
+
+| Kind | Name | Example | Purpose |
+|---|---|---|---|
+| Variable | `APP_REPO` | `luniemma/codeplex-application-ai-systhem` | `owner/name` of the app repo |
+| Secret | `APP_REPO_TOKEN` | `<fine-grained PAT>` | PAT scoped to `APP_REPO` with `contents: write` (only used to call `POST /repos/.../dispatches`) |
+
+If either is unset, the dispatch step no-ops with a clear notice — the cluster apply still succeeds, you'd just have to deploy the app manually.
+
+Higher environments (`qa`, `staging`, `prod`) intentionally do **not** auto-deploy — the app repo's `dispatch_validate` job rejects anything but `dev`, so promotions must go through the app repo's own `workflow_dispatch` with required-reviewer gates on the `qa` / `staging` / `prod` GitHub Environments.
+
+> NAT Gateway + EKS control plane + 2× `t3.medium` nodes runs around **USD $100–150 / month**. The platform stack is the one to destroy first when you're done experimenting.
 
 ---
 
@@ -281,7 +302,7 @@ Full list lives in [variables.tf](variables.tf). Highlights:
 |---|---|---|
 | `aws_region` | `us-east-1` | Any region supported by the AWS provider |
 | `project_name` | `web` | Prefixed onto every resource name |
-| `environment` | `dev` | Must be `dev`, `staging`, or `prod` |
+| `environment` | `dev` | Must be `dev`, `staging`, `prod`, or `platform` (the shared-cluster stack) |
 
 ### Network
 
@@ -315,7 +336,7 @@ Full list lives in [variables.tf](variables.tf). Highlights:
 | `cpu_alarm_threshold` | `80` | CPU% that triggers the alarm |
 | `alarm_sns_topic_arn` | `""` | Optional SNS target for the alarm |
 
-### EKS (only when `enable_eks = true`)
+### EKS (only used by the `platform` stack — `enable_eks = true`)
 
 | Name | Default |
 |---|---|
@@ -374,7 +395,8 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
 |---|---|---|
 | PR to `main` / `master` | `dev` | validate, scan, plan (comments on PR) |
 | Push to `main` / `master` | `dev` | validate, scan, plan, apply |
-| `workflow_dispatch` | `dev` / `staging` / `prod` (pick) | validate, scan, plan, apply/destroy (if selected) |
+| `workflow_dispatch` | `dev` / `staging` / `prod` / `platform` (pick) | validate, scan, plan, apply/destroy (if selected) |
+| `workflow_dispatch` → `platform` apply | `platform` | + `trigger_app_deploy` job dispatches `deploy-app` to `APP_REPO` (no-op if `APP_REPO`/`APP_REPO_TOKEN` are unset) |
 
 ### Best-practice features baked in
 
@@ -416,8 +438,8 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
 
    Attach whatever policy lets Terraform manage VPC/EC2/IAM/EKS. Start from AWS-managed policies (`AmazonEC2FullAccess`, `AmazonVPCFullAccess`, `IAMFullAccess`) for experimentation, then tighten.
 
-3. **Create three GitHub Environments** — `dev`, `staging`, `prod` (Settings → Environments).
-   - On `prod` (and optionally `staging`), add **required reviewers** so apply pauses for manual approval.
+3. **Create four GitHub Environments** — `dev`, `staging`, `prod`, `platform` (Settings → Environments).
+   - On `prod` and `platform` (and optionally `staging`), add **required reviewers** so apply pauses for manual approval. `platform` provisions the shared cluster, so treat it like prod.
    - Per-Environment variables override repo-level variables, so each env can have its own role / bucket / region.
 
 4. **Set these Variables** at repo scope or per-Environment (Settings → Secrets and variables → Actions → Variables):
@@ -431,6 +453,13 @@ This repo ships with a reusable composite action at [.github/actions/terraform-d
    | `TERRAFORM_VERSION` | `1.9.8` | optional | repo (override default) |
    | `RUNNER_IMAGE` | `ubuntu-latest` | optional | repo (e.g. self-hosted label) |
    | `TFSEC_VERSION` | `latest` | optional | repo (e.g. `v1.28.6` to pin) |
+   | `APP_REPO` | `luniemma/codeplex-application-ai-systhem` | optional | repo (enables app auto-deploy after `platform` apply) |
+
+   And **one secret**:
+
+   | Name | Example | Required | Scope |
+   |---|---|---|---|
+   | `APP_REPO_TOKEN` | fine-grained PAT, `contents: write` on `APP_REPO` only | optional | repo (paired with `APP_REPO`) |
 
 5. **Keep `environments/<env>.tfvars` in sync** with what you actually want deployed — the workflow selects the file matching the target environment.
 
