@@ -120,3 +120,9 @@ variable "app_repo" {
   type        = string
   default     = "luniemma/codeplex-application-ai-systhem"
 }
+
+variable "cluster_admin_principals" {
+  description = "IAM principal ARNs (users or roles) that get cluster-admin access via EKS access entry. Survives destroy/apply cycles, unlike a manual CLI access entry."
+  type        = list(string)
+  default     = ["arn:aws:iam::724772096574:user/terra-project"]
+}

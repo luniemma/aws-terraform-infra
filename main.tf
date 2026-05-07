@@ -225,6 +225,31 @@ resource "aws_eks_access_policy_association" "app_deploy_admin" {
   depends_on = [aws_eks_access_entry.app_deploy]
 }
 
+# Cluster admins — IAM users/roles in var.cluster_admin_principals get the
+# AmazonEKSClusterAdminPolicy at cluster scope. Lets developers run kubectl
+# locally without re-adding access entries by hand after every destroy/apply.
+resource "aws_eks_access_entry" "cluster_admin" {
+  for_each = toset(var.cluster_admin_principals)
+
+  cluster_name  = module.eks.cluster_name
+  principal_arn = each.value
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "cluster_admin" {
+  for_each = toset(var.cluster_admin_principals)
+
+  cluster_name  = module.eks.cluster_name
+  principal_arn = each.value
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+
+  depends_on = [aws_eks_access_entry.cluster_admin]
+}
+
 ################################################################################
 # Cluster add-ons — nginx-ingress controller
 #
