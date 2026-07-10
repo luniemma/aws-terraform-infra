@@ -198,6 +198,11 @@ jobs:
           /tmp/tfsec --soft-fail .
 
       - name: Upload SARIF
+        # Uploading to code scanning needs GitHub Advanced Security, which isn't
+        # available on free private repos — the upload then fails with "Resource
+        # not accessible by integration". Don't let that fail the whole run; the
+        # tfsec findings still print in the job log above.
+        continue-on-error: true
         if: always() && hashFiles('tfsec.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
